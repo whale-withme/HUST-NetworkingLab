@@ -19,11 +19,14 @@
 #include <string.h>
 #include <stddef.h>
 #include <chrono>
+#define SLEEPTIME 20
+#define BOUND 5
 
 SOCKET getUdpSocket(){
     /*初始化socket库*/
     WSADATA wsadata;
-    int err = WSAStartup(0x1010, &wsadata);
+    WORD Versionrequire = MAKEWORD(2,2);
+    int err = WSAStartup(Versionrequire, &wsadata);
     if(err != 0){
         return -1;
     }
@@ -124,6 +127,12 @@ char* AckPack(short& number){
     return buff;
 }
 
+void GetError(FILE* fp, char* reason){
+    printf("此次传输失败，原因：%s\n", *reason);
+    fprintf(fp, "传输失败，原因：%s\n", reason);
+    return;
+}
+
 
 int main(){
     FILE* fp = fopen("ClientLog.txt", "a");
@@ -141,6 +150,7 @@ int main(){
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&sendtimeout, sizeof(int));
 
     while(1){
+    restart:
         /*客户端将要上传文件*/
         printf("====================Loading========================\n");
         printf("=====            这里是TFTP客户端               ===\n");
@@ -149,11 +159,19 @@ int main(){
         printf("===================================================\n"); 
         int choice;
         scanf("%d", &choice);
+        char host[64] = "192.168.163.1";
+        addr = getaddr(host, 1005);
+        /*if(bind(sock, (SOCKADDR*)&addr, sizeof(sockaddr_in))){
+            printf("socket 绑定失败\n");
+            fprintf(fp, "socket绑定失败\n");
+        }*/
+
+        printf("yes\n");
+        char target[64] = "127.0.0.1";
+        addr = getaddr(target, 69);
         if(choice == 1){
             /*对要输入的文件名、文件内容进行预处理*/
-            char target[64] = "127.0.0.1";
-            addr = getaddr(target, 69);        /*client发送的ip和端口号放在addr中*/
-            printf("输入要上传的文件名：\n");
+            printf("请输入你要上传的文件名：\n");
             char name[20];
             scanf("%s", &name);
             int type;
@@ -185,8 +203,9 @@ int main(){
                     break;
             }
             if(sendTimes > 10){
-                fprintf(fp, "Upload file failed. Error: sendto function timeout.\n");
-                continue;   /*此次传输失败*/
+                printf("发送WRQ失败，传输终止\n");
+                fprintf(fp, "Upload file failed. Error: send WRQ timeout.\n");
+                goto restart;   /*此次传输失败*/
             }
 
             PrintTime(fp);         /*向日志中写入当前时间*/
@@ -205,46 +224,66 @@ int main(){
             datalen = 0;
             int RST = 0;        /*记录重发*/
             int FullSize = 0;
+            int speedControl = 0;
+            int exit = 0;
+            int ConditionRecord = 0;        /*记录当前传输环境质量*/
+            int recv_times;
             while(1){
+                /*针对上一次传输进行的速度调整*/
+                if(ConditionRecord > BOUND)
+                    speedControl = 1;
+                else
+                    speedControl = 0;
+
                 /*server端开启新的socket*/
                 char recv_buf[1024];
                 sockaddr_in server;     /*服务器新开端口供接下来的传输*/
                 int len = sizeof(server);
-                /*这里的ans接受的就是ACK报文*/
+                /*这里的ans接受的就是ACK报文，同时server开启新的socket*/
                 ans = recvfrom(sock, recv_buf, 1024, 0, (sockaddr*)&server, &len);
                 int recv_len = strlen(recv_buf);        //接收区字段的长度大小
+                
                 recvTimes = 1;
-
                 /*不断重新发送直到接收到正确的ACK报文*/
                 while(ans < 0){
-                    printf("%d", recvTimes);
+                    ConditionRecord++;
+                    printf("%d times try receive ACK\n", recvTimes);
                     if(recvTimes > 10){        /*超过10次未接受到ACK即放弃*/
-                        printf("no receive datagram get. transmission failed.\n");
+                        printf("接收端响应ACK丢失\n");
                         PrintTime(fp);
                         fprintf(fp, "Upload file %s failed\n", name);
-                        break;
+                        goto restart;
                     }
-
+                    /*当速度控制，发送数据速度减缓*/
+                    if(speedControl)
+                        Sleep(SLEEPTIME);
                     int ans = sendto(sock, resend_buffer, buflen, 0, (sockaddr*)&addr, len);     /*重发*/
                     RST++;
                     std::cout << "resend last block" << std::endl;
 
                     sendTimes = 1;       /*处理sendto情况*/
                     while(ans != buflen){
+                        ConditionRecord++;
                         std::cout << "resend last block failed :" << sendTimes << "times" << std::endl;
                         if(sendTimes <= 10){
+                            if(speedControl)
+                                Sleep(SLEEPTIME);
                             ans = sendto(sock, resend_buffer, buflen, 0, (sockaddr*)&addr, len);
                             sendTimes++;
                         }
-                        else
-                            break;
+                        else{
+                            fprintf(fp, "resend block%d failed, transmission failed.\n");
+                            printf("重发上传数据block%d失败，传输失败\n");
+                            goto restart;
+                        }
                     }
-
                     ans = recvfrom(sock, recv_buf, 1024, 0, (sockaddr*)&server, &len);
-                    if(ans > 0 )
+                    if(ans > 0 ){
+                        ConditionRecord--;
                         break;
+                    }
                     recvTimes++;       /*重发次数++*/
-                }
+                }   
 
                 if(ans > 0){
                     short operation;
@@ -254,7 +293,6 @@ int main(){
                         short blockNumber;
                         memcpy(&blockNumber, recv_buf+2, 2);
                         blockNumber = ntohs(blockNumber);
-
                         if(blockNumber == block){        /*收到正确的block应答*/
                             addr = server;
                             if(feof(uploadFile) && datalen != 512){
@@ -278,9 +316,12 @@ int main(){
                             FullSize += datalen-4;      /*记录发送数据的总大小*/
                             memcpy(resend_buffer, sendData, datalen);       /*本次的block放进重发区*/
 
+                            if(speedControl)
+                                Sleep(SLEEPTIME);
                             int ans = sendto(sock, sendData, datalen, 0, (sockaddr*)&addr, sizeof(addr));
                             sendTimes = 1;
                             while(ans != datalen){
+                                ConditionRecord++;
                                 std::cout << "send block " << block << "failed" << std::endl;
                                 if(sendTimes <= 10){
                                     ans = sendto(sock, sendData, datalen, 0, (sockaddr*)&addr, sizeof(addr));
@@ -290,11 +331,14 @@ int main(){
                                     break;
                             }
                             if(sendTimes > 10){
-                                fprintf(fp, "Upload block %d failed.\n", blockNumber); 
+                                fprintf(fp, "Upload block %d failed.\nTransmisson environment bad.\n", blockNumber); 
+                                printf("当前网络状况差,发送block%d失败，传输失败\n", blockNumber);
+                                goto restart;
                            }
                             std::cout << "pack = " << block << "sent successfully!" << std::endl;
                         }
-                    }else if(operation == 5){                        
+                    }
+                    else if(operation == 5){                        
                       char errorcode[3], errorContent[512];
                       memcpy(errorcode, recv_buf+2, 2);
                       errorcode[2] = '\0';
@@ -341,11 +385,12 @@ int main(){
                     ans = sendto(sock, senddata, datalen, 0, (sockaddr*)&addr, sizeof(addr));/*重发RRQ*/
                     sendTimes++;
                 }
-                else
-                    break;
+                else{
+                    printf("发送RRQ失败，传输终止\n");
+                    fprintf(fp, "send RRQ failed, transmission stop.\n");
+                    goto restart;
+                }
             }
-            if(sendTimes > 10)
-                continue;
 		
             /*请求成功，清除上次的发送缓冲区*/
             delete []senddata;
@@ -358,7 +403,13 @@ int main(){
             int want_recv = 1;
             int RST = 0;
             int Fullsize = 0;
+            int ConditionRecord = 0;
+            int speedControl = 0;
             while(1){
+                if(ConditionRecord > BOUND)
+                    speedControl = 1;
+                else
+                    speedControl = 0;
                 /*不断接收data报文*/
                 char buf[1024];
                 sockaddr_in server;
@@ -366,34 +417,43 @@ int main(){
                 /*这里的ans接受的就是data报文*/
                 ans = recvfrom(sock, buf, 1024, 0, (sockaddr*)&server, &len);
 				
-                if(ans < 0){
+                /*尽力去发送RRQ*/
+                while(ans < 0){
+                    ConditionRecord++;
                 	int backInfo;
                     printf("Lost-resend times: %d\n", recvTimes);
                     if(recvTimes > 10){        /*超过10次未接受到ACK即放弃*/
                         printf("File %s download failed\n", name);
                         PrintTime(fp);
                         fprintf(fp, "Download file %s failed\n", name);
-                        break;
+                        goto restart;
                     }
+                    if(speedControl)
+                        Sleep(SLEEPTIME);
                     backInfo = sendto(sock, resend_buffer, buflen, 0, (sockaddr*)&addr, len);     /*重发*/
                     RST++;
                     std::cout << "Data block lost, resend last ACK." << std::endl;
 
                     sendTimes = 1;       /*处理send情况*/
                     while(backInfo != buflen){
+                        ConditionRecord++;
                         std::cout << "resend last ACK failed :" << sendTimes << "times" << std::endl;
                         if(sendTimes <= 10){
+                            if(speedControl)
+                                Sleep(SLEEPTIME);  
                             backInfo = sendto(sock, resend_buffer, buflen, 0, (sockaddr*)&addr, len);
                             sendTimes++;
                         }
-                        else
-                            break;
+                        else{
+                            printf("请求数据超时，传输失败\n");
+                            fprintf(fp, "data pack time out.\ntransmission failed.\n");
+                            goto restart;
+                        }
                     }
-                    if(sendTimes > 10)
-                        break;
                     recvTimes++;       /*重发次数++*/
                 }
-                else if(ans > 0){
+
+                if(ans > 0){
                     short flag;
                     memcpy(&flag, buf, 2);
                     flag = ntohs(flag);
@@ -406,19 +466,24 @@ int main(){
                         std::cout << "Package number: " << number << std::endl;
 						
                         char* ack = AckPack(number);
+                        if(speedControl)
+                            Sleep(SLEEPTIME);
                         int sendAck = sendto(sock, ack, 4, 0, (sockaddr*)&addr, sizeof(addr));
                         sendTimes = 1;
                         while(sendAck != 4){   /*发送失误*/
+                            ConditionRecord++;
                             std::cout << "sent last ACK failed" << sendTimes << std::endl;
                             if(sendTimes <= 10){
+                                 if(speedControl)
+                                     Sleep(SLEEPTIME);
                                 sendAck = sendto(sock, ack, 4, 0, (sockaddr*)&addr, sizeof(addr));
                                 sendTimes++;
                             }
                             else
-                                break;
+                                printf("发送数据包%dACK失败，传输终止\n", number);
+                                fprintf(fp, "send data block%d-ACK failed.\nTransmisson stop.\n");
+                                goto restart;
                         }
-                        if(sendTimes > 10)
-                            break; 
 						std::cout << "Send package " << number << " ACK successfully." << std::endl;
 						
                         /*接收正确的data包*/
@@ -461,8 +526,10 @@ int main(){
         finish:
             fclose(downloadFile);
         }
+
         if(choice == 0)
             break;
+
     }
     fclose(fp);
     int err = closesocket(sock);
